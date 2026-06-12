@@ -36,6 +36,14 @@ static const char EICAR_STRING[] =
     "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
 static const DWORD EICAR_SIZE = sizeof(EICAR_STRING) - 1;
 
+// Missing NT constant
+#ifndef DIRECTORY_QUERY
+#define DIRECTORY_QUERY 0x0001
+#endif
+
+// VHD vendor GUID (needed outside MountISO scope for MountVHD)
+static const GUID VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT = { 0xEC984AEC, 0xA0F9, 0x47e9, 0x90, 0x1F, 0x71, 0x41, 0x5A, 0x66, 0x34, 0x5B };
+
 
 HMODULE ntdllhm = GetModuleHandle(L"ntdll.dll");
 NTSTATUS(WINAPI* _NtSetInformationFile)(
@@ -78399,7 +78407,7 @@ bool MountVHD()
     wcscat(vhdxpath, wuid2);
     wcscat(vhdxpath, L".vhdx");
 
-    VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VIRTUAL_STORAGE_TYPE_VENDOR_MS };
+    VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT };
     CREATE_VIRTUAL_DISK_PARAMETERS cvdp = { 0 };
     cvdp.Version = CREATE_VIRTUAL_DISK_VERSION_2;
     cvdp.Version2.MaximumSize = 64 * 1024 * 1024;
@@ -78449,7 +78457,7 @@ bool GetSystemDevicePath()
     RtlInitUnicodeString(&devdir, L"\\Device");
     OBJECT_ATTRIBUTES devobjattr = { 0 };
     InitializeObjectAttributes(&devobjattr, &devdir, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    NTSTATUS stat = NtOpenDirectoryObject(&hdir, DIRECTORY_QUERY, &devobjattr);
+    NTSTATUS stat = _NtOpenDirectoryObject(&hdir, DIRECTORY_QUERY, &devobjattr);
     if (stat)
     {
         printf("GetSystemDevicePath: Failed to open \\Device, error: 0x%08X\n", stat);
@@ -78463,7 +78471,7 @@ bool GetSystemDevicePath()
 
     while (true)
     {
-        stat = NtQueryDirectoryObject(hdir, buffer, sizeof(buffer), FALSE, context == 0, &context, &retlen);
+        stat = _NtQueryDirectoryObject(hdir, buffer, sizeof(buffer), FALSE, context == 0, &context, &retlen);
         if (stat) break;
 
         OBJECT_DIRECTORY_INFORMATION* odi = (OBJECT_DIRECTORY_INFORMATION*)buffer;
@@ -78553,8 +78561,7 @@ bool MountISO(HANDLE* hiso)
 	}
 	CloseHandle(hf);
 
-	static const GUID VIRTUAL_STORAGE_TYPE_VENDOR_MS = { 0xEC984AEC, 0xA0F9, 0x47e9, 0x90, 0x1F, 0x71, 0x41, 0x5A, 0x66, 0x34, 0x5B };
-	VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_ISO, VIRTUAL_STORAGE_TYPE_VENDOR_MS };
+	VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_ISO, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT };
 	HANDLE hvirtdisk = NULL;
 	DWORD retval = OpenVirtualDisk(&vst, target, VIRTUAL_DISK_ACCESS_GET_INFO | VIRTUAL_DISK_ACCESS_ATTACH_RO | VIRTUAL_DISK_ACCESS_DETACH, OPEN_VIRTUAL_DISK_FLAG_NONE, NULL, &hvirtdisk);
 	if (retval)
