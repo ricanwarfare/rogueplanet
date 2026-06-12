@@ -21,7 +21,7 @@ jobs:
 
       - name: Build
         run: |
-          cl /EHsc /std:c++17 /O2 /DNDEBUG /DUNICODE /D_UNICODE RoguePlanet.cpp /link kernel32.lib bcrypt.lib taskschd.lib comsupp.lib virtdisk.lib ntdll.lib Rpcrt4.lib shlwapi.lib /OUT:RoguePlanet.exe
+          cl /EHsc /std:c++17 /O2 /DNDEBUG /DUNICODE /D_UNICODE RoguePlanet.cpp /link kernel32.lib advapi32.lib bcrypt.lib taskschd.lib comsupp.lib virtdisk.lib ntdll.lib Rpcrt4.lib shlwapi.lib /OUT:RoguePlanet.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
