@@ -78268,7 +78268,11 @@ HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 		DWORD aclSize = 256;
 		PACL pAcl = (PACL)malloc(aclSize);
 		InitializeAcl(pAcl, aclSize, ACL_REVISION);
-		AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES, pEveryoneSid);
+		// Deny WRITE but allow DELETE/rename — on a read-only ISO, Defender falls back
+		// to renaming the file instead of deleting it. We need to allow rename so Defender
+		// creates the Temp\TMP... entry that ReadDirectoryChangesW detects.
+		// Denying DELETE would block rename too, causing Defender to loop on MpCleanCallback.
+		AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_WRITE | FILE_WRITE_ATTRIBUTES, pEveryoneSid);
 		AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE, pEveryoneSid);
 		SECURITY_DESCRIPTOR sd = { 0 };
 		InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
