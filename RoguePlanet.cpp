@@ -78600,6 +78600,7 @@ bool GetSystemDevicePath()
 
                 if (htest && NT_SUCCESS(stat))
                 {
+                    printf("GetSystemDevicePath: Can open %ws (stat=0x%08X), checking for Windows dir...\n", testpath, stat);
                     wchar_t windir_test[MAX_PATH] = { 0 };
                     wcscpy(windir_test, testpath);
                     wcscat(windir_test, L"Windows");
@@ -78622,7 +78623,15 @@ bool GetSystemDevicePath()
                         printf("GetSystemDevicePath: Found system volume: %ws\n", g_devicepath);
                         break;
                     }
+                    else
+                    {
+                        printf("GetSystemDevicePath: %ws has no Windows dir (stat=0x%08X)\n", testpath, stat);
+                    }
                     CloseHandle(htest);
+                }
+                else
+                {
+                    printf("GetSystemDevicePath: Cannot open %ws (stat=0x%08X)\n", testpath, stat);
                 }
             }
             odi++;
@@ -78631,6 +78640,34 @@ bool GetSystemDevicePath()
     }
 
     CloseHandle(hdir);
+    if (!found)
+    {
+        printf("GetSystemDevicePath: No accessible HarddiskVolume via enumeration. Trying QueryDosDeviceW fallback...\n");
+        // Fallback: use QueryDosDeviceW to resolve the system drive to its NT device path
+        wchar_t sysdrive[4] = { 0 };
+        GetEnvironmentVariableW(L"SystemDrive", sysdrive, 4);
+        if (sysdrive[0])
+        {
+            wchar_t devpath[MAX_PATH] = { 0 };
+            if (QueryDosDeviceW(sysdrive, devpath, MAX_PATH))
+            {
+                // devpath is now something like \Device\HarddiskVolume3
+                // We need the path WITH a trailing backslash for NtCreateFile
+                printf("GetSystemDevicePath: QueryDosDeviceW resolved %ws -> %ws\n", sysdrive, devpath);
+                wcscpy(g_devicepath, devpath);
+                g_using_vhd = false;
+                found = true;
+            }
+            else
+            {
+                printf("GetSystemDevicePath: QueryDosDeviceW failed for %ws, error: %d\n", sysdrive, GetLastError());
+            }
+        }
+        else
+        {
+            printf("GetSystemDevicePath: SystemDrive env var not found\n");
+        }
+    }
     if (!found)
     {
         printf("GetSystemDevicePath: No accessible HarddiskVolume found\n");
@@ -78874,6 +78911,21 @@ int main()
 
 	}
 
+	// Enable disk-related privileges before attempting mounts
+	// These are needed for OpenVirtualDisk/AttachVirtualDisk (ISO/VHD mount)
+	HANDLE hselftoken = NULL;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hselftoken))
+	{
+		SetPrivilege(hselftoken, L"SeDiskSecurityPrivilege", TRUE);   // SeDiskSecurityPrivilege
+		SetPrivilege(hselftoken, SE_BACKUP_NAME, TRUE);          // SeBackupPrivilege
+		SetPrivilege(hselftoken, SE_RESTORE_NAME, TRUE);         // SeRestorePrivilege
+		SetPrivilege(hselftoken, SE_MANAGE_VOLUME_NAME, TRUE);   // SeManageVolumePrivilege
+		CloseHandle(hselftoken);
+	}
+	else
+	{
+		printf("Warning: Could not open process token for privilege escalation (error %d). Mounts may fail.\n", GetLastError());
+	}
 
 	HANDLE hpipe = CreateNamedPipe(L"\\\\.\\pipe\\RoguePlanet", PIPE_ACCESS_DUPLEX, PIPE_WAIT, PIPE_UNLIMITED_INSTANCES, NULL, NULL, NULL, NULL);
 	if (!hpipe || hpipe == INVALID_HANDLE_VALUE)
