@@ -15,6 +15,7 @@
 #include <comdef.h>
 #include <taskschd.h>
 #include <bcrypt.h>
+#include <aclapi.h>
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "taskschd.lib")
