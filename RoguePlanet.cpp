@@ -77974,10 +77974,20 @@ cleanup:
 }
 
 
+// Global event signaled by MpCleanCallbackFunction when Defender starts threat cleaning.
+// Used as a fallback trigger on Windows Server where ReadDirectoryChangesW doesn't
+// see the expected rename (Defender uses callback-based remediation on NTFS, not
+// file-rename-based remediation as on read-only ISO).
+HANDLE g_cleanEvent = NULL;
+volatile LONG g_cleanCallbackCount = 0;
+
 DWORD MpCleanCallbackFunction()
 {
-
-	printf("MpCleanCallbackFunction called.\n");
+	LONG count = InterlockedIncrement(&g_cleanCallbackCount);
+	printf("MpCleanCallbackFunction called (count=%ld).\n", count);
+	// Signal the main thread on the first callback call
+	if (count == 1 && g_cleanEvent)
+		SetEvent(g_cleanEvent);
 	return 0;
 }
 
@@ -78896,6 +78906,7 @@ int main()
 		g_using_vhd = false;
 		g_hvhd = hvirtdisk;
 	}
+	g_cleanEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	wchar_t windir2[MAX_PATH] = { 0 };
 	GetWindowsDirectory(windir2, MAX_PATH);
 
@@ -79064,35 +79075,48 @@ int main()
 	if (hc)
 		CloseHandle(hc);
 
-
-	do {
-		ZeroMemory(buff, sizeof(buff));
-		DWORD retbytes = NULL;
-		printf("[DEBUG] Waiting for ReadDirectoryChangesW (FILE_NAME change)...\n");
-		ReadDirectoryChangesW(hwin, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME, &retbytes, NULL, NULL);
-		PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
-		printf("[DEBUG] ReadDirectoryChangesW returned: FileName=%ws, Action=%d, FileNameLength=%d\n", 
-			pfni->FileNameLength > 0 ? pfni->FileName : L"(null)", pfni->Action, pfni->FileNameLength);
-		// Widen the filter: accept any file rename under Temp\ that starts with TMP or is
-		// a hex-looking quarantine name. On NTFS, Defender may use different naming patterns.
-		// Original filter: pfni->FileNameLength / 2 != 24 || _wcsnicmp(...)
-		wchar_t* fname = pfni->FileName;
-		DWORD fnamelen = pfni->FileNameLength / 2;
-		// Accept if filename starts with "Temp\" (5 chars)
-		if (fnamelen > 5 && _wcsnicmp(fname, L"Temp\\", 5) == 0)
-		{
-			printf("[DEBUG] Matched Temp\\ file change: %ws (len=%d)\n", fname, fnamelen);
-			break;
-		}
-		// Also accept the original pattern
-		if (fnamelen == 24 && _wcsnicmp(fname, teststr, 8) == 0)
-		{
-			printf("[DEBUG] Matched original Temp\\TMP pattern: %ws\n", fname);
-			break;
-		}
-		continue;
-	} while (1);
-	printf("[DEBUG] ReadDirectoryChangesW: detected expected rename, proceeding.\n");
+	// On Server (no ISO/VHD), Defender uses callback-based remediation instead of
+	// file-rename-based remediation. ReadDirectoryChangesW won't see the expected rename.
+	// Use the MpCleanCallbackFunction event as the trigger instead.
+	if (!g_using_vhd)
+	{
+		printf("[DEBUG] Server mode: waiting for MpCleanCallback signal instead of ReadDirectoryChangesW\n");
+		WaitForSingleObject(g_cleanEvent, 30000); // 30s timeout
+		printf("[DEBUG] MpCleanCallback signal received (or timeout). Callback count=%ld\n", g_cleanCallbackCount);
+		// Small delay to let Defender's remediation access the junction path
+		Sleep(500);
+	}
+	else
+	{
+		do {
+			ZeroMemory(buff, sizeof(buff));
+			DWORD retbytes = NULL;
+			printf("[DEBUG] Waiting for ReadDirectoryChangesW (FILE_NAME change)...\n");
+			ReadDirectoryChangesW(hwin, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME, &retbytes, NULL, NULL);
+			PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
+			printf("[DEBUG] ReadDirectoryChangesW returned: FileName=%ws, Action=%d, FileNameLength=%d\n", 
+				pfni->FileNameLength > 0 ? pfni->FileName : L"(null)", pfni->Action, pfni->FileNameLength);
+			// Widen the filter: accept any file rename under Temp\ that starts with TMP or is
+			// a hex-looking quarantine name. On NTFS, Defender may use different naming patterns.
+			// Original filter: pfni->FileNameLength / 2 != 24 || _wcsnicmp(...)
+			wchar_t* fname = pfni->FileName;
+			DWORD fnamelen = pfni->FileNameLength / 2;
+			// Accept if filename starts with "Temp\" (5 chars)
+			if (fnamelen > 5 && _wcsnicmp(fname, L"Temp\\", 5) == 0)
+			{
+				printf("[DEBUG] Matched Temp\\ file change: %ws (len=%d)\n", fname, fnamelen);
+				break;
+			}
+			// Also accept the original pattern
+			if (fnamelen == 24 && _wcsnicmp(fname, teststr, 8) == 0)
+			{
+				printf("[DEBUG] Matched original Temp\\TMP pattern: %ws\n", fname);
+				break;
+			}
+			continue;
+		} while (1);
+		printf("[DEBUG] ReadDirectoryChangesW: detected expected rename, proceeding.\n");
+	}
 
 
 	wchar_t workdir2[MAX_PATH] = {L"\\??\\"};
